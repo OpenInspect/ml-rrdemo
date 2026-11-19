@@ -112,14 +112,64 @@ def build_model(img_size, pretrained=True):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, desc="eval"):
+def evaluate(model, loader, device, desc="eval", score_thresh=0.5, iop_thresh=0.5):
     model.eval()
     metric = MeanAveragePrecision(iou_type="bbox", class_metrics=True)
+    all_preds, all_targets = [], []
     for imgs, targets in tqdm(loader, desc=desc, leave=False):
         outs = model([i.to(device) for i in imgs])
         preds = [{k: v.cpu() for k, v in o.items()} for o in outs]
-        metric.update(preds, [{k: v for k, v in t.items()} for t in targets])
-    return metric.compute()
+        targets = [{k: v for k, v in t.items()} for t in targets]
+        metric.update(preds, targets)
+        all_preds += preds
+        all_targets += targets
+    m = metric.compute()
+    m["overlap"] = overlap_stats(all_preds, all_targets, score_thresh, iop_thresh)
+    return m
+
+
+def overlap_stats(preds, targets, score_thresh, iop_thresh):
+    """Localisation metrics that forgive predictions smaller than (and inside) the annotated box.
+
+    IoP = intersection area / *prediction* area. A prediction fully inside a GT box has IoP = 1 however small it is,
+    whereas a huge box that merely touches a small GT has IoP ~ 0, so oversized boxes can't game it.
+
+    Precision-side (per prediction, score >= score_thresh):
+        touch       - overlaps any GT box at all
+        in_gt       - IoP >= iop_thresh with any GT box
+        in_gt_cls   - same, and the GT box has the same class
+    Recall-side (per GT box):
+        covered     - some prediction has IoP >= iop_thresh with it
+        covered_cls - same, and the prediction has the right class
+    """
+    c = dict(n_pred=0, touch=0, in_gt=0, in_gt_cls=0, n_gt=0, covered=0, covered_cls=0)
+    for p, t in zip(preds, targets):
+        keep = p["scores"] >= score_thresh
+        pb, pl = p["boxes"][keep], p["labels"][keep]
+        gb, gl = t["boxes"], t["labels"]
+        c["n_pred"] += len(pb)
+        c["n_gt"] += len(gb)
+        if len(pb) == 0 or len(gb) == 0:
+            continue
+        lt = torch.max(pb[:, None, :2], gb[None, :, :2])
+        rb = torch.min(pb[:, None, 2:], gb[None, :, 2:])
+        wh = (rb - lt).clamp(min=0)
+        inter = wh[..., 0] * wh[..., 1]                                   # [P, G]
+        area_p = ((pb[:, 2] - pb[:, 0]) * (pb[:, 3] - pb[:, 1])).clamp(min=1e-6)
+        inside = inter / area_p[:, None] >= iop_thresh
+        same = pl[:, None] == gl[None, :]
+        c["touch"] += (inter > 0).any(1).sum().item()
+        c["in_gt"] += inside.any(1).sum().item()
+        c["in_gt_cls"] += (inside & same).any(1).sum().item()
+        c["covered"] += inside.any(0).sum().item()
+        c["covered_cls"] += (inside & same).any(0).sum().item()
+    r = lambda a, b: a / b if b else 0.0
+    return {
+        "touch": r(c["touch"], c["n_pred"]), "in_gt": r(c["in_gt"], c["n_pred"]),
+        "in_gt_cls": r(c["in_gt_cls"], c["n_pred"]),
+        "covered": r(c["covered"], c["n_gt"]), "covered_cls": r(c["covered_cls"], c["n_gt"]),
+        "n_pred": c["n_pred"], "n_gt": c["n_gt"],
+    }
 
 
 COLORS = {"Bad_podu": (255, 64, 64), "Bad_qiaojiao": (64, 160, 255)}
@@ -180,8 +230,12 @@ def predict(image_path, weights, score_thresh, save_path, show, gt=None):
 
 def fmt(m):
     per = m["map_per_class"].tolist() if m["map_per_class"].ndim else [float(m["map_per_class"])]
+    o = m["overlap"]
     return (f"mAP@.5 {m['map_50'].item():.3f}  mAP@.5:.95 {m['map'].item():.3f}  "
-            f"AR@100 {m['mar_100'].item():.3f}  per-class mAP {[round(x, 3) for x in per]}")
+            f"AR@100 {m['mar_100'].item():.3f}  per-class mAP {[round(x, 3) for x in per]}\n"
+            f"      overlap ({o['n_pred']} preds / {o['n_gt']} GT): "
+            f"preds touching GT {o['touch']:.3f}, inside GT {o['in_gt']:.3f} (right class {o['in_gt_cls']:.3f}); "
+            f"GT covered {o['covered']:.3f} (right class {o['covered_cls']:.3f})")
 
 
 def main():
@@ -201,7 +255,10 @@ def main():
     ap.add_argument("--out", default="detector_best.pt")
     ap.add_argument("--predict", metavar="IMAGE", help="run detection on this image and exit (no training)")
     ap.add_argument("--weights", default=None, help="checkpoint for --predict (default: --out)")
-    ap.add_argument("--score-thresh", type=float, default=0.5)
+    ap.add_argument("--score-thresh", type=float, default=0.5,
+                    help="confidence cutoff for --predict and for the overlap metrics")
+    ap.add_argument("--iop-thresh", type=float, default=0.5,
+                    help="a prediction counts as 'inside' a GT box if intersection/prediction-area >= this")
     ap.add_argument("--save", default="prediction.png", help="where --predict writes the annotated image")
     ap.add_argument("--gt", nargs="?", const="auto", default=None, metavar="XML",
                     help="also draw ground-truth boxes in green; optional XML path, "
@@ -262,7 +319,7 @@ def main():
             sched.step()
             run += loss.item()
             pbar.set_postfix(loss=f"{run / step:.3f}", lr=f"{sched.get_last_lr()[0]:.4f}")
-        m = evaluate(model, val_loader, device, desc="val")
+        m = evaluate(model, val_loader, device, "val", args.score_thresh, args.iop_thresh)
         mem = torch.cuda.max_memory_allocated() / 2**30 if amp else 0
         tqdm.write(f"epoch {epoch + 1:02d}/{args.epochs} loss {run / len(train_loader):.3f} | val {fmt(m)} | VRAM {mem:.1f} GiB")
         if m["map_50"].item() > best:
@@ -271,7 +328,7 @@ def main():
 
     print(f"\nbest val mAP@.5 {best:.3f}; evaluating that checkpoint on held-out test set")
     model.load_state_dict(torch.load(args.out)["state_dict"])
-    print("TEST", fmt(evaluate(model, test_loader, device, desc="test")))
+    print("TEST", fmt(evaluate(model, test_loader, device, "test", args.score_thresh, args.iop_thresh)))
 
 
 if __name__ == "__main__":
