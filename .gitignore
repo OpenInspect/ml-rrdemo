@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+*.pt
+pcb-aoi.zip
+train_data
+test_data
+train_data_augmentation
