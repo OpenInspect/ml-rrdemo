@@ -12,6 +12,10 @@ dependencies = [
     "tqdm>=4.70.1",
 ]
 
+[tool.uv]
+# Always use uv-managed CPython so Windows never picks up a 32-bit system Python (PyTorch has no wheels for it).
+python-preference = "only-managed"
+
 [dependency-groups]
 dev = ["ipykernel"]
 
